@@ -41,7 +41,7 @@ class Config:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.1
+    ent_coef: float = 0.05
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
@@ -173,53 +173,55 @@ def make_env_fn(cfg: Config) -> Callable[[], gym.Env]:
     return _init
 
 
-def rollout_and_save_gif(
-    model: PPO,
-    cfg: Config,
-    gif_path: str,
-    max_steps: int,
-    fps: int,
-    seed: Optional[int] = None,
-) -> float:
-    """
-    Runs ONE episode with rendering and saves an animated GIF.
-    Returns episode reward (under the same shaped reward as training).
-    """
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+def rollout_and_save_gif(model, cfg, gif_path, max_steps, fps, seed=None):
     os.makedirs(os.path.dirname(gif_path), exist_ok=True)
 
-    env = gym.make(cfg.env_id, hardcore=cfg.hardcore, render_mode="rgb_array")
-    env = WalkerRewardShaping(
-        env,
-        forward_coef=cfg.r_forward_coef,
-        alive_coef=cfg.r_alive_coef,
-        height_coef=cfg.r_height_coef,
-        effort_coef=cfg.r_effort_coef,
-        height_tol=cfg.r_height_tol,
-        vx_clip=(cfg.r_vx_clip_low, cfg.r_vx_clip_high),
-    )
+    def make_render_env():
+        env = gym.make(cfg.env_id, hardcore=cfg.hardcore, render_mode="rgb_array")
+        env = WalkerRewardShaping(
+            env,
+            forward_coef=cfg.r_forward_coef,
+            alive_coef=cfg.r_alive_coef,
+            height_coef=cfg.r_height_coef,
+            effort_coef=cfg.r_effort_coef,
+            height_tol=cfg.r_height_tol,
+            vx_clip=(cfg.r_vx_clip_low, cfg.r_vx_clip_high),
+        )
+        return env
 
-    obs, info = env.reset(seed=seed)
-    frames: List[np.ndarray] = []
+    # VecNormalize expects a VecEnv, so use DummyVecEnv with 1 env
+    venv = DummyVecEnv([make_render_env])
 
+    # Load the normalization stats from training
+    vecnorm_path = os.path.join(cfg.run_dir, "vecnormalize.pkl")
+    venv = VecNormalize.load(vecnorm_path, venv)
+
+    # IMPORTANT: do not update stats during rollout
+    venv.training = False
+    venv.norm_reward = False  # keep rewards interpretable during rollouts
+
+    obs = venv.reset()
+    frames = []
     ep_reward = 0.0
+
     for _ in range(max_steps):
-        frame = env.render()
+        frame = venv.envs[0].render()
         if frame is not None:
             frames.append(frame)
 
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = env.step(action)
-        ep_reward += float(reward)
-
-        if terminated or truncated:
+        obs, reward, done, info = venv.step(action)
+        ep_reward += float(reward[0])
+        if done[0]:
             break
 
-    env.close()
-
-    if len(frames) >= 1:
+    venv.close()
+    if frames:
         imageio.mimsave(gif_path, frames, fps=fps)
-
     return ep_reward
+
 
 
 class GifRecorderCallback(BaseCallback):
