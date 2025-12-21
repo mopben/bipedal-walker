@@ -24,13 +24,14 @@ class Config:
     total_timesteps: int = 500_000
 
     # Reward shaping (tunable)
-    r_forward_coef: float = 1.0
-    r_alive_coef: float = 1.5
-    r_height_coef: float = 1.5
+    r_forward_coef: float = 0.0 # base already has forward coef     
+    r_alive_coef: float = 0.02      
+    r_height_coef: float = 0.01      
     r_effort_coef: float = 0.01
-    r_height_tol: float = 0.5
+    r_height_tol: float = 0.6       
     r_vx_clip_low: float = -1.0
     r_vx_clip_high: float = 3.0
+
 
     # PPO hyperparams
     learning_rate: float = 3e-4
@@ -40,7 +41,7 @@ class Config:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.0
+    ent_coef: float = 0.1
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
@@ -137,7 +138,7 @@ class WalkerRewardShaping(gym.Wrapper):
         # effort penalty
         r_effort = -self.effort_coef * float(np.sum(np.square(action)))
 
-        shaped_reward = float(r_forward + r_alive + r_height + r_effort)
+        shaped_reward = float(_base_reward + r_forward + r_alive + r_height + r_effort)
 
         # log components
         info = dict(info)
