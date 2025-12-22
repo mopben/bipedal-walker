@@ -1,300 +1,305 @@
 import os
+import copy
 from dataclasses import dataclass
-from typing import Optional, List, Callable
+from typing import Callable, Optional, Tuple
 
 import gymnasium as gym
-import numpy as np
 import imageio
+import numpy as np
 
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CallbackList
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import VecNormalize
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, sync_envs_normalization
 
 
-@dataclass
+@dataclass(frozen=True)
 class Config:
     env_id: str = "BipedalWalker-v3"
     hardcore: bool = False
 
-    # Training
     seed: int = 42
-    n_envs: int = 8
-    total_timesteps: int = 500_000
+    n_envs: int = 32
+    total_timesteps: int = 1_000_000
 
-    # Reward shaping (tunable)
-    r_forward_coef: float = 0.0 # base already has forward coef     
-    r_alive_coef: float = 0.02      
-    r_height_coef: float = 0.01      
-    r_effort_coef: float = 0.01
-    r_height_tol: float = 0.6       
-    r_vx_clip_low: float = -1.0
-    r_vx_clip_high: float = 3.0
+    # ---- Reward shaping schedule (training wheels) ----
+    # The environment’s base reward is already shaped; these terms are meant ONLY to reduce early collapse.
+    # Professional default: anneal to zero so the final policy is optimized for the true task reward.
+    shaping_enabled: bool = True
+    alive_coef_start: float = 0.01     # per-step bonus while not done (small!)
+    alive_coef_end: float = 0.0
+    alive_anneal_steps: int = 50_000  # linearly anneal over first N env timesteps
 
+    # Keep these OFF by default (base env already incentivizes forward progress and penalizes torque)
+    forward_coef: float = 0.0          # optional: coef * clip(vx, low, high)
+    effort_coef: float = 0.0           # optional: -coef * sum(action^2)
+    vx_clip_low: float = -1.0
+    vx_clip_high: float = 3.0
 
-    # PPO hyperparams
+    # ---- PPO ----
     learning_rate: float = 3e-4
-    n_steps: int = 2048
+    n_steps: int = 512
     batch_size: int = 64
     n_epochs: int = 10
-    gamma: float = 0.99
+    gamma: float = 0.999
     gae_lambda: float = 0.95
-    clip_range: float = 0.2
-    ent_coef: float = 0.05
+    clip_range: float = 0.18
+    ent_coef: float = 0.0             # “lock in” gait; reduce drift
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
-    # Logging / saving
-    run_dir: str = "runs/bipedalwalker_ppo"
-    gif_every_steps: int = 50_000      # record a GIF every N training steps
-    gif_max_steps: int = 1600          # cap frames per GIF
+    # ---- Artifacts ----
+    run_dir: str = "runs/bipedalwalker_ppo_expert_baseline"
+    gif_every_steps: int = 200_000
+    gif_max_steps: int = 1600
     gif_fps: int = 30
 
-    # Eval
-    eval_every_steps: int = 50_000
+    # ---- Eval (base reward only) ----
+    eval_every_steps: int = 200_000
     n_eval_episodes: int = 5
 
 
+# ----------------------------- Env / Reward Shaping -----------------------------
+
 class WalkerRewardShaping(gym.Wrapper):
     """
-    Reward = forward velocity + alive bonus + walking-height bonus - effort penalty
+    Additive reward shaping (training wheels). IMPORTANT: base reward is preserved.
 
-    forward velocity: obs[2]
-    alive bonus: +alive_coef each step until terminated/truncated
-    walking height: encourage hull y-position near target (set at reset)
-    effort penalty: -effort_coef * sum(action^2)
+    shaped_reward = base_reward
+                  + forward_coef * clip(vx, low, high)
+                  + alive_coef (only if not done)
+                  - effort_coef * sum(action^2)
     """
     def __init__(
         self,
         env: gym.Env,
-        forward_coef: float = 1.0,
-        alive_coef: float = 1.0,
-        height_coef: float = 1.0,
-        effort_coef: float = 0.02,
-        height_tol: float = 0.5,
-        vx_clip: tuple[float, float] = (-1.0, 3.0),
+        forward_coef: float,
+        alive_coef: float,
+        effort_coef: float,
+        vx_clip: Tuple[float, float],
     ):
         super().__init__(env)
         self.forward_coef = float(forward_coef)
         self.alive_coef = float(alive_coef)
-        self.height_coef = float(height_coef)
         self.effort_coef = float(effort_coef)
-        self.height_tol = float(height_tol)
         self.vx_clip = (float(vx_clip[0]), float(vx_clip[1]))
 
-        self.target_height: Optional[float] = None
-
-    def set_coefs(
+    # Called via VecEnv.env_method("set_shaping", ...) even through Monitor wrapper
+    def set_shaping(
         self,
         forward_coef: Optional[float] = None,
         alive_coef: Optional[float] = None,
-        height_coef: Optional[float] = None,
         effort_coef: Optional[float] = None,
-    ):
+    ) -> None:
         if forward_coef is not None:
             self.forward_coef = float(forward_coef)
         if alive_coef is not None:
             self.alive_coef = float(alive_coef)
-        if height_coef is not None:
-            self.height_coef = float(height_coef)
         if effort_coef is not None:
             self.effort_coef = float(effort_coef)
 
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        try:
-            self.target_height = float(self.env.unwrapped.hull.position[1])
-        except Exception:
-            self.target_height = None
-        return obs, info
-
     def step(self, action):
-        obs, _base_reward, terminated, truncated, info = self.env.step(action)
+        obs, base_r, terminated, truncated, info = self.env.step(action)
 
-        # forward velocity (x) is obs[2] for BipedalWalker
-        vx = float(obs[2])
-        vx_c = float(np.clip(vx, self.vx_clip[0], self.vx_clip[1]))
-        r_forward = self.forward_coef * vx_c
-
-        # alive bonus (per timestep while episode continues)
+        vx = float(obs[2])  # BipedalWalker forward velocity
+        r_forward = self.forward_coef * float(np.clip(vx, *self.vx_clip))
         r_alive = 0.0 if (terminated or truncated) else self.alive_coef
-
-        # height bonus (prefer true hull y; fallback to hull angle proxy)
-        r_height = 0.0
-        if self.target_height is not None:
-            try:
-                hull_y = float(self.env.unwrapped.hull.position[1])
-                z = (hull_y - self.target_height) / self.height_tol
-                # peak at target height; negative if far away (clipped)
-                r_height = self.height_coef * float(np.clip(1.0 - z * z, -1.0, 1.0))
-            except Exception:
-                hull_angle = float(obs[0])
-                r_height = self.height_coef * float(np.exp(-abs(hull_angle)))
-        else:
-            hull_angle = float(obs[0])
-            r_height = self.height_coef * float(np.exp(-abs(hull_angle)))
-
-        # effort penalty
         r_effort = -self.effort_coef * float(np.sum(np.square(action)))
 
-        shaped_reward = float(_base_reward + r_forward + r_alive + r_height + r_effort)
+        r = float(base_r + r_forward + r_alive + r_effort)
 
-        # log components
         info = dict(info)
-        info["r_forward"] = float(r_forward)
-        info["r_alive"] = float(r_alive)
-        info["r_height"] = float(r_height)
-        info["r_effort"] = float(r_effort)
-        info["r_total"] = float(shaped_reward)
-
-        return obs, shaped_reward, terminated, truncated, info
+        info.update(r_forward=r_forward, r_alive=r_alive, r_effort=r_effort, r_total=r, r_base=float(base_r))
+        return obs, r, terminated, truncated, info
 
 
-def make_env_fn(cfg: Config) -> Callable[[], gym.Env]:
-    """
-    Returns a thunk (callable with no args) that constructs a *fresh* env.
-    This is the correct pattern for SB3's make_vec_env.
-    """
-    def _init():
-        env = gym.make(cfg.env_id, hardcore=cfg.hardcore)
+def make_base_env(cfg: Config, render_mode: Optional[str] = None) -> gym.Env:
+    """Environment with NO shaping (base reward only)."""
+    env = gym.make(cfg.env_id, hardcore=cfg.hardcore, render_mode=render_mode)
+    return Monitor(env)
+
+
+def make_train_env(cfg: Config, render_mode: Optional[str] = None) -> gym.Env:
+    """Training environment (optionally with shaping)."""
+    env = gym.make(cfg.env_id, hardcore=cfg.hardcore, render_mode=render_mode)
+    if cfg.shaping_enabled:
         env = WalkerRewardShaping(
             env,
-            forward_coef=cfg.r_forward_coef,
-            alive_coef=cfg.r_alive_coef,
-            height_coef=cfg.r_height_coef,
-            effort_coef=cfg.r_effort_coef,
-            height_tol=cfg.r_height_tol,
-            vx_clip=(cfg.r_vx_clip_low, cfg.r_vx_clip_high),
+            forward_coef=cfg.forward_coef,
+            alive_coef=cfg.alive_coef_start,
+            effort_coef=cfg.effort_coef,
+            vx_clip=(cfg.vx_clip_low, cfg.vx_clip_high),
         )
-        env = Monitor(env)  # monitor should wrap the final reward you train on
-        return env
-
-    return _init
+    return Monitor(env)
 
 
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+def make_train_env_thunk(cfg: Config) -> Callable[[], gym.Env]:
+    return lambda: make_train_env(cfg, render_mode=None)
 
-def rollout_and_save_gif(model, cfg, gif_path, max_steps, fps, seed=None):
+
+def make_eval_env_thunk(cfg: Config) -> Callable[[], gym.Env]:
+    # Eval MUST be on base reward only (no shaping wrapper)
+    return lambda: make_base_env(cfg, render_mode=None)
+
+
+# ----------------------------- GIF Rollout (correct normalization, base reward env) -----------------------------
+
+def _build_normalized_render_venv(cfg: Config, src_norm: VecNormalize) -> VecNormalize:
+    """
+    Create a 1-env render VecEnv with VecNormalize stats copied from the training VecNormalize.
+    Rendering uses the base environment (no shaping) so rewards align with evaluation.
+    """
+    venv = DummyVecEnv([lambda: make_base_env(cfg, render_mode="rgb_array")])
+    venv = VecNormalize(venv, norm_obs=True, norm_reward=False, clip_obs=src_norm.clip_obs)
+
+    # Copy running stats from training env
+    venv.obs_rms = copy.deepcopy(src_norm.obs_rms)
+    venv.training = False
+    venv.norm_reward = False
+    return venv
+
+
+def rollout_and_save_gif(
+    model: PPO,
+    cfg: Config,
+    src_norm: VecNormalize,
+    gif_path: str,
+    max_steps: int,
+    fps: int,
+    seed: Optional[int] = None,
+) -> float:
     os.makedirs(os.path.dirname(gif_path), exist_ok=True)
 
-    def make_render_env():
-        env = gym.make(cfg.env_id, hardcore=cfg.hardcore, render_mode="rgb_array")
-        env = WalkerRewardShaping(
-            env,
-            forward_coef=cfg.r_forward_coef,
-            alive_coef=cfg.r_alive_coef,
-            height_coef=cfg.r_height_coef,
-            effort_coef=cfg.r_effort_coef,
-            height_tol=cfg.r_height_tol,
-            vx_clip=(cfg.r_vx_clip_low, cfg.r_vx_clip_high),
-        )
-        return env
+    venv = _build_normalized_render_venv(cfg, src_norm)
 
-    # VecNormalize expects a VecEnv, so use DummyVecEnv with 1 env
-    venv = DummyVecEnv([make_render_env])
-
-    # Load the normalization stats from training
-    vecnorm_path = os.path.join(cfg.run_dir, "vecnormalize.pkl")
-    venv = VecNormalize.load(vecnorm_path, venv)
-
-    # IMPORTANT: do not update stats during rollout
-    venv.training = False
-    venv.norm_reward = False  # keep rewards interpretable during rollouts
-
+    # SB3 VecEnvs generally do NOT accept reset(seed=...) on VecNormalize wrappers
+    if seed is not None:
+        venv.seed(seed)
     obs = venv.reset()
-    frames = []
-    ep_reward = 0.0
 
+    frames = []
+    ep_r = 0.0
     for _ in range(max_steps):
-        frame = venv.envs[0].render()
-        if frame is not None:
-            frames.append(frame)
+        frames.append(venv.envs[0].render())
 
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, info = venv.step(action)
-        ep_reward += float(reward[0])
-        if done[0]:
+        obs, rewards, dones, infos = venv.step(action)
+        ep_r += float(rewards[0])
+
+        if bool(dones[0]):
             break
 
+    imageio.mimsave(gif_path, frames, fps=fps)
     venv.close()
-    if frames:
-        imageio.mimsave(gif_path, frames, fps=fps)
-    return ep_reward
+    return ep_r
 
+
+# ----------------------------- Callbacks -----------------------------
+
+class ShapingScheduleCallback(BaseCallback):
+    """
+    Linearly anneal alive shaping from alive_coef_start -> alive_coef_end over alive_anneal_steps.
+    Applies to the *training* envs only. Eval/GIF envs remain base reward only.
+
+    This avoids the "camping for alive reward" failure mode while still improving early stability.
+    """
+    def __init__(self, cfg: Config):
+        super().__init__(verbose=0)
+        self.cfg = cfg
+
+    def _alive_coef_at(self, t: int) -> float:
+        if self.cfg.alive_anneal_steps <= 0:
+            return float(self.cfg.alive_coef_end)
+        frac = min(max(t / float(self.cfg.alive_anneal_steps), 0.0), 1.0)
+        return float((1.0 - frac) * self.cfg.alive_coef_start + frac * self.cfg.alive_coef_end)
+
+    def _on_step(self) -> bool:
+        if not self.cfg.shaping_enabled:
+            return True
+
+        # self.num_timesteps is in "env steps" already (SB3 tracks global env timesteps)
+        alive = self._alive_coef_at(self.num_timesteps)
+
+        # training_env is VecNormalize -> underlying VecEnv supports env_method
+        # The outer Monitor wrapper forwards attributes to inner WalkerRewardShaping via gym.Wrapper __getattr__.
+        try:
+            self.training_env.env_method(
+                "set_shaping",
+                forward_coef=self.cfg.forward_coef,
+                alive_coef=alive,
+                effort_coef=self.cfg.effort_coef,
+            )
+        except Exception:
+            # If shaping is disabled or wrapper not present, ignore
+            pass
+        return True
 
 
 class GifRecorderCallback(BaseCallback):
-    """
-    Records a rollout GIF every `gif_every_steps` training steps.
-    Rendering happens in a separate non-vector env (rgb_array),
-    so it does not slow down the vectorized training env much.
-    """
-    def __init__(self, cfg: Config, verbose: int = 0):
-        super().__init__(verbose)
+    def __init__(self, cfg: Config):
+        super().__init__(verbose=0)
         self.cfg = cfg
-        self.next_record_step = cfg.gif_every_steps
+        self.next_step = cfg.gif_every_steps
 
     def _on_step(self) -> bool:
-        if self.num_timesteps >= self.next_record_step:
-            gif_name = f"step_{self.num_timesteps:08d}.gif"
-            gif_path = os.path.join(self.cfg.run_dir, "gifs", gif_name)
+        if self.num_timesteps < self.next_step:
+            return True
 
-            try:
-                ep_r = rollout_and_save_gif(
-                    model=self.model,
-                    cfg=self.cfg,
-                    gif_path=gif_path,
-                    max_steps=self.cfg.gif_max_steps,
-                    fps=self.cfg.gif_fps,
-                    seed=self.cfg.seed,
-                )
-                if self.verbose:
-                    print(f"[GIF] Saved {gif_path} (episode reward={ep_r:.1f})")
-            except Exception as e:
-                print(f"[GIF] Failed to save GIF at step {self.num_timesteps}: {e}")
+        env = self.model.get_env()
+        if not isinstance(env, VecNormalize):
+            raise TypeError("Training env must be VecNormalize to record normalized GIFs correctly.")
 
-            self.next_record_step += self.cfg.gif_every_steps
+        path = os.path.join(self.cfg.run_dir, "gifs", f"step_{self.num_timesteps:08d}.gif")
+        try:
+            ep_r = rollout_and_save_gif(
+                model=self.model,
+                cfg=self.cfg,
+                src_norm=env,
+                gif_path=path,
+                max_steps=self.cfg.gif_max_steps,
+                fps=self.cfg.gif_fps,
+                seed=self.cfg.seed,
+            )
+            print(f"[GIF] {path} (base_ep_reward={ep_r:.1f})")
+        except Exception as e:
+            print(f"[GIF] Failed at step {self.num_timesteps}: {e}")
 
+        self.next_step += self.cfg.gif_every_steps
         return True
 
+
+class SyncedEvalCallback(EvalCallback):
+    """
+    EvalCallback that keeps eval VecNormalize statistics synced with the training VecNormalize.
+    Eval runs on base env reward only (no shaping wrapper).
+    """
+    def _on_step(self) -> bool:
+        try:
+            sync_envs_normalization(self.training_env, self.eval_env)
+        except Exception:
+            pass
+        return super()._on_step()
+
+
+# ----------------------------- Main -----------------------------
 
 def main():
     cfg = Config()
     os.makedirs(cfg.run_dir, exist_ok=True)
 
-    # --- Training env (vectorized, no rendering) ---
-    vec_env = make_vec_env(
-        make_env_fn(cfg),
-        n_envs=cfg.n_envs,
-        seed=cfg.seed,
-    )
+    # Train env: reward shaping optionally enabled, but reward normalization OFF.
+    train_env = make_vec_env(make_train_env_thunk(cfg), n_envs=cfg.n_envs, seed=cfg.seed)
+    train_env = VecNormalize(train_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
 
-    # Normalize observations/rewards (often helpful for BipedalWalker)
-    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
-
-    # --- Separate eval env ---
-    eval_env = make_vec_env(
-        make_env_fn(cfg),
-        n_envs=1,
-        seed=cfg.seed + 1000,
-    )
-    # For eval: normalize obs, but keep rewards interpretable
+    # Eval env: base reward only; VecNormalize synced from train env.
+    eval_env = make_vec_env(make_eval_env_thunk(cfg), n_envs=1, seed=cfg.seed + 1000)
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
-
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=os.path.join(cfg.run_dir, "best_model"),
-        log_path=os.path.join(cfg.run_dir, "eval_logs"),
-        eval_freq=cfg.eval_every_steps,
-        n_eval_episodes=cfg.n_eval_episodes,
-        deterministic=True,
-        render=False,
-    )
+    eval_env.training = False
 
     model = PPO(
-        policy="MlpPolicy",
-        env=vec_env,
+        "MlpPolicy",
+        train_env,
         verbose=1,
         tensorboard_log=os.path.join(cfg.run_dir, "tb"),
         seed=cfg.seed,
@@ -308,35 +313,60 @@ def main():
         ent_coef=cfg.ent_coef,
         vf_coef=cfg.vf_coef,
         max_grad_norm=cfg.max_grad_norm,
+        sde_sample_freq=4
     )
 
-    gif_callback = GifRecorderCallback(cfg, verbose=1)
+    callbacks = CallbackList([
+        ShapingScheduleCallback(cfg),
+        SyncedEvalCallback(
+            eval_env,
+            best_model_save_path=os.path.join(cfg.run_dir, "best_model"),
+            log_path=os.path.join(cfg.run_dir, "eval_logs"),
+            # Convert env-step frequency to callback-step frequency for vectorized envs.
+            # Each callback step advances num_timesteps by n_envs.
+            eval_freq=max(1, cfg.eval_every_steps // cfg.n_envs),
+            n_eval_episodes=cfg.n_eval_episodes,
+            deterministic=True,
+        ),
+        GifRecorderCallback(cfg),
+    ])
 
-    model.learn(
-        total_timesteps=cfg.total_timesteps,
-        callback=[eval_callback, gif_callback],
-        progress_bar=True,
-    )
+    model.learn(total_timesteps=cfg.total_timesteps, callback=callbacks, progress_bar=True)
 
-    # Save final model + VecNormalize stats
+    # Save final artifacts (model + normalization)
     model_path = os.path.join(cfg.run_dir, "final_model.zip")
     vecnorm_path = os.path.join(cfg.run_dir, "vecnormalize.pkl")
     model.save(model_path)
-    vec_env.save(vecnorm_path)
+    train_env.save(vecnorm_path)
 
-    # Final GIF
-    final_gif_path = os.path.join(cfg.run_dir, "gifs", "final.gif")
-    ep_r = rollout_and_save_gif(
+    # Render final model on BASE reward env
+    rollout_and_save_gif(
         model=model,
         cfg=cfg,
-        gif_path=final_gif_path,
+        src_norm=train_env,
+        gif_path=os.path.join(cfg.run_dir, "gifs", "final.gif"),
         max_steps=cfg.gif_max_steps,
         fps=cfg.gif_fps,
         seed=cfg.seed,
     )
-    print(f"[FINAL] Saved {final_gif_path} (episode reward={ep_r:.1f})")
 
-    vec_env.close()
+    # Render best eval model (if it exists)
+    best_path = os.path.join(cfg.run_dir, "best_model", "best_model.zip")
+    if os.path.exists(best_path):
+        best_model = PPO.load(best_path, env=train_env)
+        rollout_and_save_gif(
+            model=best_model,
+            cfg=cfg,
+            src_norm=train_env,
+            gif_path=os.path.join(cfg.run_dir, "gifs", "best.gif"),
+            max_steps=cfg.gif_max_steps,
+            fps=cfg.gif_fps,
+            seed=cfg.seed,
+        )
+        print(f"[DONE] Saved best.gif from {best_path}")
+
+    print(f"[DONE] Saved final_model.zip and vecnormalize.pkl in {cfg.run_dir}")
+    train_env.close()
     eval_env.close()
 
 
