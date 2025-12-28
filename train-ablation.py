@@ -8,12 +8,18 @@ import gymnasium as gym
 import imageio
 import numpy as np
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CallbackList
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, sync_envs_normalization
 
+
+# ----------------------------- Config -----------------------------
 
 @dataclass(frozen=True)
 class Config:
@@ -54,8 +60,11 @@ class Config:
     gif_fps: int = 30
 
     # ---- Eval (base reward only) ----
-    eval_every_steps: int = 50_000
+    eval_every_steps: int = 100_000
     n_eval_episodes: int = 10
+
+
+# ----------------------------- Reward Shaping Wrapper -----------------------------
 
 class WalkerRewardShaping(gym.Wrapper):
     """Additive shaping (training wheels). Base reward is preserved."""
@@ -108,13 +117,127 @@ class WalkerRewardShaping(gym.Wrapper):
         return obs, r, terminated, truncated, info
 
 
+# ----------------------------- RND (training-only) -----------------------------
+
+class RunningMeanStd:
+    """Online mean/std for scalar normalization."""
+    def __init__(self, eps: float = 1e-8):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = eps
+
+    def update(self, x: float) -> None:
+        x = float(x)
+        self.count += 1.0
+        delta = x - self.mean
+        self.mean += delta / self.count
+        delta2 = x - self.mean
+        self.var += delta * delta2
+
+    @property
+    def std(self) -> float:
+        denom = max(self.count - 1.0, 1.0)
+        return float(np.sqrt(self.var / denom))
+
+
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, hidden: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class RNDWrapper(gym.Wrapper):
+    """
+    Random Network Distillation - training only wrapper.
+
+    Intrinsic reward = normalized predictor MSE vs fixed random target network.
+    We expose set_rnd_scale() so a global schedule (via callback) can anneal RND.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        obs_dim: int,
+        hidden: int = 64,
+        out_dim: int = 32,
+        lr: float = 1e-4,
+        device: str = "cpu",
+    ):
+        super().__init__(env)
+        self.device = device
+
+        self.target = MLP(obs_dim, out_dim, hidden).to(device)
+        self.predictor = MLP(obs_dim, out_dim, hidden).to(device)
+        for p in self.target.parameters():
+            p.requires_grad_(False)
+
+        self.opt = optim.Adam(self.predictor.parameters(), lr=lr)
+        self.rms = RunningMeanStd()
+
+        # Current scale (set by callback). Default 0.0 so it is safe if unset.
+        self._rnd_scale: float = 0.0
+
+    def set_rnd_scale(self, scale: float) -> None:
+        self._rnd_scale = float(scale)
+
+    def step(self, action):
+        obs, r_ext, terminated, truncated, info = self.env.step(action)
+
+        # No intrinsic reward if scale is zero (or extremely small)
+        if self._rnd_scale <= 0.0:
+            info = dict(info)
+            info.setdefault("r_int", 0.0)
+            info.setdefault("r_ext", float(r_ext))
+            return obs, float(r_ext), terminated, truncated, info
+
+        x = torch.as_tensor(obs, dtype=torch.float32, device=self.device).view(1, -1)
+
+        with torch.no_grad():
+            tgt = self.target(x)
+        pred = self.predictor(x)
+
+        mse = torch.mean((pred - tgt) ** 2)
+        mse_scalar = float(mse.detach().cpu().item())
+
+        # Update predictor
+        self.opt.zero_grad(set_to_none=True)
+        mse.backward()
+        self.opt.step()
+
+        # Normalize prediction error
+        self.rms.update(mse_scalar)
+        norm_err = (mse_scalar - self.rms.mean) / (self.rms.std + 1e-8)
+        r_int = self._rnd_scale * float(norm_err)
+
+        r_total = float(r_ext + r_int)
+        info = dict(info)
+        info.update(r_int=float(r_int), r_ext=float(r_ext), rnd_err=float(mse_scalar))
+        return obs, r_total, terminated, truncated, info
+
+
+# ----------------------------- Env builders -----------------------------
+
 def make_base_env(cfg: Config, render_mode: Optional[str] = None) -> gym.Env:
     env = gym.make(cfg.env_id, hardcore=cfg.hardcore, render_mode=render_mode)
-    return Monitor(env)
+    # Monitor should be near the base; do not put it as the outermost wrapper
+    env = Monitor(env)
+    return env
 
 
-def make_train_env(cfg: Config, render_mode: Optional[str] = None) -> gym.Env:
+def make_train_env(cfg: Config, args: argparse.Namespace, render_mode: Optional[str] = None) -> gym.Env:
     env = gym.make(cfg.env_id, hardcore=cfg.hardcore, render_mode=render_mode)
+    env = Monitor(env)
+
+    # Training wheels shaping
     if cfg.shaping_enabled:
         env = WalkerRewardShaping(
             env,
@@ -123,16 +246,32 @@ def make_train_env(cfg: Config, render_mode: Optional[str] = None) -> gym.Env:
             effort_coef=cfg.effort_coef,
             vx_clip=(cfg.vx_clip_low, cfg.vx_clip_high),
         )
-    return Monitor(env)
+
+    # Optional RND (training only)
+    if args.use_rnd:
+        obs_dim = int(np.prod(env.observation_space.shape))
+        env = RNDWrapper(
+            env,
+            obs_dim=obs_dim,
+            hidden=args.rnd_hidden,
+            out_dim=args.rnd_out_dim,
+            lr=args.rnd_lr,
+            device="cpu",
+        )
+
+    return env
 
 
-def make_train_env_thunk(cfg: Config) -> Callable[[], gym.Env]:
-    return lambda: make_train_env(cfg, render_mode=None)
+def make_train_env_thunk(cfg: Config, args: argparse.Namespace) -> Callable[[], gym.Env]:
+    return lambda: make_train_env(cfg, args, render_mode=None)
 
 
 def make_eval_env_thunk(cfg: Config) -> Callable[[], gym.Env]:
+    # Eval must be BASE reward only (no shaping, no RND)
     return lambda: make_base_env(cfg, render_mode=None)
 
+
+# ----------------------------- GIF rendering (base reward, synced norm) -----------------------------
 
 def _build_normalized_render_venv(cfg: Config, src_norm: VecNormalize) -> VecNormalize:
     """1-env render VecEnv with VecNormalize stats copied from training."""
@@ -178,6 +317,8 @@ def rollout_and_save_gif(
     return ep_r
 
 
+# ----------------------------- Callbacks -----------------------------
+
 class ShapingScheduleCallback(BaseCallback):
     """Linearly anneal alive shaping from start to end over alive_anneal_steps."""
 
@@ -196,6 +337,7 @@ class ShapingScheduleCallback(BaseCallback):
             return True
 
         alive = self._alive_coef_at(self.num_timesteps)
+        # If shaping wrapper exists anywhere in the chain, __getattr__ will forward
         try:
             self.training_env.env_method(
                 "set_shaping",
@@ -204,6 +346,31 @@ class ShapingScheduleCallback(BaseCallback):
                 effort_coef=self.cfg.effort_coef,
             )
         except Exception:
+            pass
+        return True
+
+
+class RNDScheduleCallback(BaseCallback):
+    """Anneal RND scale from start to end over rnd_anneal_steps. No-op if RND not enabled."""
+
+    def __init__(self, rnd_scale_start: float, rnd_scale_end: float, rnd_anneal_steps: int):
+        super().__init__(verbose=0)
+        self.start = float(rnd_scale_start)
+        self.end = float(rnd_scale_end)
+        self.steps = int(rnd_anneal_steps)
+
+    def _scale_at(self, t: int) -> float:
+        if self.steps <= 0:
+            return self.end
+        frac = min(max(t / float(self.steps), 0.0), 1.0)
+        return float((1.0 - frac) * self.start + frac * self.end)
+
+    def _on_step(self) -> bool:
+        scale = self._scale_at(self.num_timesteps)
+        try:
+            self.training_env.env_method("set_rnd_scale", scale)
+        except Exception:
+            # If RND isn't present, this is fine.
             pass
         return True
 
@@ -253,24 +420,35 @@ class SyncedEvalCallback(EvalCallback):
         return super()._on_step()
 
 
+# ----------------------------- CLI -----------------------------
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--total_timesteps", type=int, default=1_000_000)
     p.add_argument("--exp_name", type=str, default="baseline")
 
-    # Improvements / ablations
+    # PPO improvements / ablations
     p.add_argument("--use_sde", action="store_true")
     p.add_argument("--sde_sample_freq", type=int, default=4)
     p.add_argument("--sde_init_sigma", type=float, default=0.5)
     p.add_argument("--target_kl", type=float, default=0.0)  # 0 disables
 
+    # RND toggle + schedule + net params
+    p.add_argument("--use_rnd", action="store_true")
+    p.add_argument("--rnd_scale_start", type=float, default=0.05)
+    p.add_argument("--rnd_scale_end", type=float, default=0.0)
+    p.add_argument("--rnd_anneal_steps", type=int, default=250_000)
+    p.add_argument("--rnd_lr", type=float, default=1e-4)
+    p.add_argument("--rnd_hidden", type=int, default=64)
+    p.add_argument("--rnd_out_dim", type=int, default=32)
+
     # Optional knobs for quicker iteration
     p.add_argument("--n_envs", type=int, default=32)
     p.add_argument("--n_steps", type=int, default=2048)
     p.add_argument("--n_eval_episodes", type=int, default=10)
-    p.add_argument("--eval_every_steps", type=int, default=50_000)
-    p.add_argument("--gif_every_steps", type=int, default=50_000)
+    p.add_argument("--eval_every_steps", type=int, default=100_000)
+    p.add_argument("--gif_every_steps", type=int, default=200_000)
 
     return p.parse_args()
 
@@ -289,13 +467,18 @@ def build_cfg(args: argparse.Namespace) -> Config:
     )
 
 
+# ----------------------------- Main -----------------------------
+
 def main() -> None:
+
     args = parse_args()
     cfg = build_cfg(args)
+    print(f"[CONFIG] gif_every_steps = {cfg.gif_every_steps}")
+
     os.makedirs(cfg.run_dir, exist_ok=True)
 
-    # Train env: shaping optional; reward normalization OFF.
-    train_env = make_vec_env(make_train_env_thunk(cfg), n_envs=cfg.n_envs, seed=cfg.seed)
+    # Train env: shaping optional; RND optional; reward normalization OFF.
+    train_env = make_vec_env(make_train_env_thunk(cfg, args), n_envs=cfg.n_envs, seed=cfg.seed)
     train_env = VecNormalize(train_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
 
     # Eval env: base reward only; VecNormalize synced from train env.
@@ -322,36 +505,46 @@ def main() -> None:
         max_grad_norm=cfg.max_grad_norm,
     )
 
-    # Improvement #1: gSDE (smooth exploration)
+    # Improvement: gSDE
     if args.use_sde:
         ppo_kwargs.update(
             use_sde=True,
             sde_sample_freq=args.sde_sample_freq,
-            policy_kwargs={"sde_init_sigma": float(args.sde_init_sigma)},
+            policy_kwargs={"log_std_init": float(np.log(args.sde_init_sigma))},
         )
 
-    # Improvement #2: KL early stopping
+    # Improvement: KL early stopping
     if args.target_kl and args.target_kl > 0:
         ppo_kwargs.update(target_kl=float(args.target_kl))
 
     model = PPO(**ppo_kwargs)
 
-    callbacks = CallbackList(
-        [
-            ShapingScheduleCallback(cfg),
-            SyncedEvalCallback(
-                eval_env,
-                best_model_save_path=os.path.join(cfg.run_dir, "best_model"),
-                log_path=os.path.join(cfg.run_dir, "eval_logs"),
-                eval_freq=max(1, cfg.eval_every_steps // cfg.n_envs),
-                n_eval_episodes=cfg.n_eval_episodes,
-                deterministic=True,
-            ),
-            GifRecorderCallback(cfg),
-        ]
-    )
+    callbacks = [
+        ShapingScheduleCallback(cfg),
+        SyncedEvalCallback(
+            eval_env,
+            best_model_save_path=os.path.join(cfg.run_dir, "best_model"),
+            log_path=os.path.join(cfg.run_dir, "eval_logs"),
+            # EvalCallback eval_freq is in *callback calls*, so divide by n_envs
+            eval_freq=max(1, cfg.eval_every_steps // cfg.n_envs),
+            n_eval_episodes=cfg.n_eval_episodes,
+            deterministic=True,
+        ),
+        GifRecorderCallback(cfg),
+    ]
 
-    model.learn(total_timesteps=cfg.total_timesteps, callback=callbacks, progress_bar=True)
+    # RND schedule callback only if RND is enabled
+    if args.use_rnd:
+        callbacks.insert(
+            1,
+            RNDScheduleCallback(
+                rnd_scale_start=args.rnd_scale_start,
+                rnd_scale_end=args.rnd_scale_end,
+                rnd_anneal_steps=args.rnd_anneal_steps,
+            ),
+        )
+
+    model.learn(total_timesteps=cfg.total_timesteps, callback=CallbackList(callbacks), progress_bar=True)
 
     # Save final artifacts (model + normalization)
     model_path = os.path.join(cfg.run_dir, "final_model.zip")
@@ -393,4 +586,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Optional: make torch a bit less aggressive on CPU threads
+    torch.set_num_threads(1)
     main()

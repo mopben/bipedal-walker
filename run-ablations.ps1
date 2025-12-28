@@ -1,4 +1,4 @@
-$script = "train_bipedalwalker_ppo_gif_expert_baseline_annealed_ablation.py"
+$script = "train-ablation.py"
 $steps  = 1000000
 $seeds  = 0,1,2
 
