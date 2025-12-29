@@ -1,6 +1,6 @@
 ## File Structure
 
-**runs** - stores evaluation results, gifs, and graphs from runs; runs/ablations/_plots stores the graphs while every other folder in runs/albations stores the results of an experiment
+**runs** - stores evaluation results, gifs, and graphs from runs; runs/ablations/_plots stores the graphs while every other folder in runs/albations stores the results of an experiment; each experiment stores gifs from intermediate steps and the best model and evaluation metrics
 
 **extract_metrics.py** - prints eval mean reward for all 3 seeds of a specified experiment; run by using *python extract_metrics.py [experiment name]*
 
