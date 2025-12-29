@@ -7,7 +7,7 @@
 **plot_seeds.py** - saves a plot of the mean learning curve the and mean eval 
 reward for all experiments
 
-**run-ablations.ps1** - runs all ablation combinations conseuctively
+**run_ablations.ps1** - runs all ablation combinations conseuctively
 
 **train.py** - trains the models and saves evaluation results and gifs into *runs* folder
 
