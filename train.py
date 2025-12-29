@@ -34,7 +34,7 @@ class Config:
     shaping_enabled: bool = True
     alive_coef_start: float = 0.01
     alive_coef_end: float = 0.0
-    alive_anneal_steps: int = 100_000
+    alive_anneal_steps: int = 250_000
 
     forward_coef: float = 0.0
     effort_coef: float = 0.0
@@ -235,7 +235,6 @@ def make_base_env(cfg: Config, render_mode: Optional[str] = None) -> gym.Env:
 
 def make_train_env(cfg: Config, args: argparse.Namespace, render_mode: Optional[str] = None) -> gym.Env:
     env = gym.make(cfg.env_id, hardcore=cfg.hardcore, render_mode=render_mode)
-    env = Monitor(env)
 
     # Training wheels shaping
     if cfg.shaping_enabled:
@@ -258,6 +257,7 @@ def make_train_env(cfg: Config, args: argparse.Namespace, render_mode: Optional[
             lr=args.rnd_lr,
             device="cpu",
         )
+    env = Monitor(env)
 
     return env
 
@@ -431,7 +431,7 @@ def parse_args() -> argparse.Namespace:
     # PPO improvements / ablations
     p.add_argument("--use_sde", action="store_true")
     p.add_argument("--sde_sample_freq", type=int, default=4)
-    p.add_argument("--sde_init_sigma", type=float, default=0.5)
+    p.add_argument("--sde_init_sigma", type=float, default=0.3)
     p.add_argument("--target_kl", type=float, default=0.0)  # 0 disables
 
     # RND toggle + schedule + net params
@@ -445,7 +445,7 @@ def parse_args() -> argparse.Namespace:
 
     # Optional knobs for quicker iteration
     p.add_argument("--n_envs", type=int, default=32)
-    p.add_argument("--n_steps", type=int, default=2048)
+    p.add_argument("--n_steps", type=int, default=512)
     p.add_argument("--n_eval_episodes", type=int, default=10)
     p.add_argument("--eval_every_steps", type=int, default=100_000)
     p.add_argument("--gif_every_steps", type=int, default=400_000)

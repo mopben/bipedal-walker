@@ -17,22 +17,22 @@ function RunConfig([string]$exp, [string[]]$extraArgs) {
 # RunConfig "sde" @("--use_sde")
 
 # RND
-RunConfig "rnd" @("--use_rnd", "--rnd_scale_start", "0.05", "--rnd_anneal_steps", "250000")
+# RunConfig "rnd" @("--use_rnd", "--rnd_scale_start", "0.05", "--rnd_anneal_steps", "250000")
 
 # gSDE + KL
-RunConfig "sde_kl" @("--use_sde", "--target_kl", "0.03")
+#RunConfig "sde_kl" @("--use_sde", "--target_kl", "0.03")
 
 # gSDE + RND
 RunConfig "sde_rnd" @("--use_sde", "--use_rnd", "--rnd_scale_start", "0.05", "--rnd_anneal_steps", "250000")
 
 # RND + KL
-RunConfig "rnd_kl" @("--use_rnd", "--rnd_scale_start", "0.05", "--rnd_anneal_steps", "250000", "--target_kl", "0.03")
+#RunConfig "rnd_kl" @("--use_rnd", "--rnd_scale_start", "0.05", "--rnd_anneal_steps", "250000", "--target_kl", "0.03")
 
 # gSDE + RND + KL (full stack)
-RunConfig "sde_rnd_kl" @("--use_sde", "--use_rnd", "--rnd_scale_start", "0.05", "--rnd_anneal_steps", "250000", "--target_kl", "0.03")
+#RunConfig "sde_rnd_kl" @("--use_sde", "--use_rnd", "--rnd_scale_start", "0.05", "--rnd_anneal_steps", "250000", "--target_kl", "0.03")
 
 # KL-stop
- RunConfig "kl" @("--target_kl", "0.03")
+ #RunConfig "kl" @("--target_kl", "0.03")
 
 
 Write-Host "ALL RUNS COMPLETE."
