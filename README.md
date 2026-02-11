@@ -58,19 +58,19 @@ Generalized State-Dependent Exploration (gSDE)
 
 
 
-### Issues Encountered
+## Issues Encountered
 
 The base PPO does not stay alive long enough to discover walking, often just falling onto the ground almost immediately. I tried to fix this by adding rewards for staying alive and maintaining a high vertical height. This, however, caused the walker to discover a local optimum by staying still and simply staying alive. I then removed the reward for height and had the staying alive reward removed after 250,000 steps. After these adjustments, the model could now walk reasonably competently.
 
 I identified two areas of potential improvement from this baseline: stability (the baseline model sometimes made catastrophic policy shifts) and exploration. After searching the literature, I implemented early stopping (KLE-Stop), RND, and gSDE. KLE-Stop aimed to improve stability, RND aimed to improve exploration, and gSDE aimed to improve both. After testing all three improvements, however, I found that KLE-Stop and its combinations with other improvements performed substantially worse than the baseline model, while the gSDE + RND model had adequate stability. Because of this, I removed KLE-Stop, ending up with the final model.
 
-### Conclusion
+## Conclusion
 
 Minor reward shaping by temporarily encouraging survival was valuable in accelerating learning in the early steps, although it was important to not overshape. gSDE and RND both substantially improved performance over the baseline, both individually and especially combined. The final model was also notably much more consistent between seeds compared to the earlier models.
 
 In the future, the model could be modified to move faster. The learning curve for the final model plateaued fairly early on, suggesting that running more steps would not notably increase performance. A potential solution is to encourage exploration even more, so the model finds a more efficient method of movement.
 
-### References 
+## References 
 Burda, Y., Edwards, H., Storkey, A., and Klimov, O. 2019. Exploration by Random Network Distillation. International Conference on Learning Representations (ICLR). 
 
 Raffin, A., Kober, J., and Stulp, F. 2022. Smooth Exploration for Robotic Reinforcement Learning. In Proceedings of the 5th Conference on Robot Learning (CoRL), Proceedings of Machine Learning Research (PMLR), 164:1634–1644.
