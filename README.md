@@ -72,4 +72,5 @@ In the future, the model could be modified to move faster. The learning curve fo
 
 ### References 
 Burda, Y., Edwards, H., Storkey, A., and Klimov, O. 2019. Exploration by Random Network Distillation. International Conference on Learning Representations (ICLR). 
+
 Raffin, A., Kober, J., and Stulp, F. 2022. Smooth Exploration for Robotic Reinforcement Learning. In Proceedings of the 5th Conference on Robot Learning (CoRL), Proceedings of Machine Learning Research (PMLR), 164:1634–1644.
